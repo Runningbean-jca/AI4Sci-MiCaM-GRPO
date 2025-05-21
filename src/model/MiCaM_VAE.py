@@ -95,7 +95,7 @@ class MiCaM(nn.Module):
             hidden_size=self.hidden_size,
             latent_size=self.latent_size,
             dropout=self.dropout,
-            use_motif_embed=False,
+            use_motif_embed=True,
         )
 
         self.prop_pred = MLP(

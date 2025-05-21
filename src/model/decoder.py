@@ -144,20 +144,9 @@ class Decoder(nn.Module):
         self.graph_encoder = Encoder(atom_embedding, edge_embedding, decoder_gnn)
         self.motif_encoder = Encoder(atom_embedding, edge_embedding, motif_gnn)
 
-        if use_motif_embed:
-            with torch.no_grad():
-                node_embed, graph_embed = self.motif_encoder(motif_graphs)
-                self.motif_node_embed = node_embed[motif_vocab.get_conns_idx()]
-                self.motif_graph_embed = graph_embed
-        else:
-            self.motif_node_embed = nn.Parameter(torch.randn(
-                len(motif_vocab.get_conns_idx()),
-                motif_embed_size
-            ))
-            self.motif_graph_embed = nn.Parameter(torch.randn(
-                len(motif_vocab),
-                motif_embed_size
-            ))
+        # 不再保留静态 embedding，全部改为动态计算
+        self.motif_node_embed = None  # 删除静态 embedding
+        self.motif_graph_embed = None
 
         self.startNN = MLP(
             in_channels=latent_size,
@@ -198,12 +187,9 @@ class Decoder(nn.Module):
 
         batch_size = len(z)
 
-        if not dev:
-            batch_motif_graphs = self.motif_graphs.index_select(input.motifs_list)
-            batch_motif_graphs = Batch.from_data_list(batch_motif_graphs).cuda()
-            motif_node_vecs, motif_graph_vecs = self.motif_encoder(batch_motif_graphs)
-        else:
-            motif_node_vecs, motif_graph_vecs = self.motif_node_embed, self.motif_graph_embed
+        batch_motif_graphs = self.motif_graphs.index_select(input.motifs_list)
+        batch_motif_graphs = Batch.from_data_list(batch_motif_graphs).to(z.device)
+        motif_node_vecs, motif_graph_vecs = self.motif_encoder(batch_motif_graphs)
 
         start_scores = torch.matmul(self.startNN(z), motif_graph_vecs.T)
         start_loss = self.start_loss(start_scores, input.batch_start_labels) / batch_size
@@ -250,12 +236,12 @@ class Decoder(nn.Module):
             torch.cuda.empty_cache()
         motif_node_embed = motif_node_embed[self.motif_vocab.get_conns_idx()]
         motif_embed = (motif_node_embed, motif_graph_embed)
-        torch.save((self.motif_node_embed.data, self.motif_graph_embed.data), file)
+        torch.save((motif_node_embed, motif_graph_embed), file)
 
     def load_motifs_embed(self, file):
         node_embed, graph_embed = torch.load(file)
-        self.motif_node_embed.data.copy_(node_embed.cuda())
-        self.motif_graph_embed.data.copy_(graph_embed.cuda())
+        self.motif_node_embed = nn.Parameter(node_embed.cuda())
+        self.motif_graph_embed = nn.Parameter(graph_embed.cuda())
 
     def pick_fisrt_motifs_for_batch(
             self,
@@ -269,8 +255,8 @@ class Decoder(nn.Module):
         # start_scores = torch.softmax(temperature * torch.matmul(self.startNN(latent_reprs), self.motif_graph_embed.T),
         #                              dim=-1)
         motif_graphs = Batch.from_data_list(self.motif_graphs.to_data_list()).to(self.device)
-        # _, graph_embed = self.motif_encoder(motif_graphs)
-        start_scores = torch.softmax(temperature * torch.matmul(self.startNN(latent_reprs), self.motif_graph_embed.T), dim=-1)
+        _, motif_graph_vecs = self.motif_encoder(motif_graphs)
+        start_scores = torch.softmax(temperature * torch.matmul(self.startNN(latent_reprs), motif_graph_vecs.T), dim=-1)
         motif_indices = sample_from_distribution(start_scores, greedy=greedy, topk=beam_top)
 
         for decoder_state in decoder_states:
@@ -350,10 +336,11 @@ class Decoder(nn.Module):
             query = self.queryNN(torch.cat((latent_reprs, graph_reprs, query_atoms_reprs), -1))
 
             # key_motif_connections = self.keyNN(self.motif_node_embed)
-            motif_graphs = Batch.from_data_list(self.motif_graphs.to_data_list()).to(self.device)
             # node_embed, _ = self.motif_encoder(motif_graphs)
             # node_embed = node_embed[self.motif_vocab.get_conns_idx()]
-            node_embed = self.motif_node_embed
+            motif_graphs = Batch.from_data_list(self.motif_graphs.to_data_list()).to(self.device)
+            node_embed, _ = self.motif_encoder(motif_graphs)
+            node_embed = node_embed[self.motif_vocab.get_conns_idx()]
             key_motif_connections = self.keyNN(node_embed)
             scores_motif_connection = torch.matmul(query, key_motif_connections.T)
 
@@ -410,9 +397,12 @@ class Decoder(nn.Module):
 
         results = [decoder_state.result(return_trace=return_trace) for decoder_state in decoder_states]
         del latent_reprs
-        for decoder_state in decoder_states:
-            del decoder_state.latent_repr, decoder_state.current_graph_data
-            del decoder_state
+        for state in decoder_states:
+            del state.latent_repr
+            del state.current_graph_data
+            del state.motif_node_vecs
+            del state.motif_graph_vecs
+            del state
         torch.cuda.empty_cache()
         return results
 
@@ -428,11 +418,9 @@ class Decoder(nn.Module):
         query = self.queryNN(torch.cat((state.latent_repr, graph_repr, query_atom_repr), dim=-1))
 
         # 🔹Motif部分 logits
-        # key_motif = self.keyNN(self.motif_node_embed)  # shape: [N_motif_conn, hidden]
         motif_graphs = Batch.from_data_list(self.motif_graphs.to_data_list()).to(self.device)
-        # node_embed, _ = self.motif_encoder(motif_graphs)
-        # node_embed = node_embed[self.motif_vocab.get_conns_idx()]
-        node_embed = self.motif_node_embed
+        node_embed, _ = self.motif_encoder(motif_graphs)
+        node_embed = node_embed[self.motif_vocab.get_conns_idx()]
         key_motif = self.keyNN(node_embed)
         motif_logits = torch.matmul(query, key_motif.T)
 
@@ -457,7 +445,7 @@ class Decoder(nn.Module):
 
         probs = torch.softmax(logits, dim=-1)
         idx = sample_from_distribution(probs, greedy=greedy)
-        log_prob = torch.log(probs[idx] + 1e-6)
+        log_prob = torch.log(probs[idx] + 1e-6).squeeze(0)
 
         # 🔹确定动作
         if idx < len(self.motif_vocab.bond_type_conns_dict[bond_type]):
